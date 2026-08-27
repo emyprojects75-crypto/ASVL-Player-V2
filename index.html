@@ -396,10 +396,11 @@ function loadDB(){
       db.settings = db.settings || {};
       if(!db.settings.allowedLanguages) db.settings.allowedLanguages = [];
       if(!db.settings.allowedGroups) db.settings.allowedGroups = [];
+      if(!db.settings.selectedSourceIds) db.settings.selectedSourceIds = [];
       return db;
     }
   }catch(e){}
-  return { sources:[], items:{live:[],movies:[],series:[],radio:[]}, favorites:{}, history:{}, continueWatching:{}, settings:{theme:'dark', allowedLanguages:[], allowedGroups:[]} };
+  return { sources:[], items:{live:[],movies:[],series:[],radio:[]}, favorites:{}, history:{}, continueWatching:{}, settings:{theme:'dark', allowedLanguages:[], allowedGroups:[], selectedSourceIds:[]} };
 }
 let DB = loadDB();
 function saveDB(){
@@ -563,6 +564,7 @@ const CORS_PROXIES = [
   u => u,
   u => 'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(u),
   u => 'https://corsproxy.io/?url=' + encodeURIComponent(u),
+  u => 'https://thingproxy.freeboard.io/fetch/' + u,
   u => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u)
 ];
 async function fetchTextWithFallback(url){
@@ -576,7 +578,7 @@ async function fetchTextWithFallback(url){
       return text;
     }catch(e){ lastErr = e; }
   }
-  throw new Error('Could not reach URL (network/CORS blocked): '+(lastErr&&lastErr.message||'unknown error'));
+  throw new Error('Could not reach URL — tried direct + 4 relays, all blocked or unreachable. The source itself may be blocking automated access, or the link may be dead/incorrect. Tap "Open URL" on this source to check it manually in your browser.');
 }
 async function fetchJSONWithFallback(url){
   const text = await fetchTextWithFallback(url);
@@ -692,8 +694,10 @@ function allContentFlat(){
 function passesGlobalFilter(item){
   const langs = (DB.settings.allowedLanguages)||[];
   const groups = (DB.settings.allowedGroups)||[];
+  const srcSel = (DB.settings.selectedSourceIds)||[];
   if(langs.length && !langs.includes(item.language)) return false;
   if(groups.length && !groups.includes(item.group)) return false;
+  if(srcSel.length && !(item.streams||[]).some(s=>srcSel.includes(s.sourceId))) return false;
   return true;
 }
 function visibleItems(kind){ return DB.items[kind].filter(passesGlobalFilter); }
@@ -735,9 +739,11 @@ function cardHtml(item, kind, opts){
    be found and played directly instead of always landing on the merged
    channel with its auto-failover behavior. */
 function flattenSingleLinks(items){
+  const srcSel = (DB.settings.selectedSourceIds)||[];
   const out = [];
   items.forEach(it=>{
     (it.streams||[]).forEach((s,i)=>{
+      if(srcSel.length && !srcSel.includes(s.sourceId)) return;
       out.push(Object.assign({}, it, {
         __streamIdx: i,
         name: it.streams.length>1 ? (it.name+' · '+s.label) : it.name,
@@ -841,13 +847,27 @@ function renderSourcesTab(){
     mainEl.innerHTML = `<div class="empty"><div class="big">🔗</div>No sources added yet.</div>`;
     return;
   }
-  mainEl.innerHTML = `<div class="section-title">Your Sources</div>` + DB.sources.map(s=>`
+  const sel = DB.settings.selectedSourceIds||[];
+  const banner = sel.length ? `
+    <div style="background:rgba(92,200,255,.1);border:1px solid var(--focus);border-radius:12px;
+      padding:10px 14px;margin-bottom:12px;font-size:12px;color:var(--focus);display:flex;
+      align-items:center;justify-content:space-between;gap:10px;">
+      <span>Showing content from ${sel.length} selected source${sel.length>1?'s':''} only, everywhere in the app.</span>
+      <button class="btn ghost" id="clearSourceSelectBtn" style="width:auto;padding:6px 12px;">Show All Sources</button>
+    </div>` : `
+    <div style="font-size:11px;color:var(--sub);margin-bottom:10px;">Tick a source's checkbox to show only its channels app-wide — handy for testing which source's links actually work.</div>`;
+  mainEl.innerHTML = `<div class="section-title">Your Sources</div>` + banner + DB.sources.map(s=>`
     <div class="source-item">
       <div class="si-status ${s.status==='ok'?'ok':s.status==='bad'?'bad':'pending'}"></div>
       <div style="flex:1;min-width:0;">
         <div class="si-name">${esc(s.name)} <span style="color:var(--sub);font-weight:400;">(${s.type})</span></div>
         <div class="si-meta">${s.status==='ok' ? `Live ${s.counts?.live||0} · Media ${s.counts?.movies||0} · Series ${s.counts?.series||0} · Radio ${s.counts?.radio||0}` : s.status==='bad' ? esc(s.error||'Failed') : 'Importing…'}</div>
       </div>
+      ${s.status==='ok' ? `<label style="display:flex;align-items:center;gap:5px;font-size:11px;color:var(--sub);cursor:pointer;flex-shrink:0;padding:0 4px;">
+        <input type="checkbox" data-srcselect="${s.id}" ${sel.includes(s.id)?'checked':''} style="width:17px;height:17px;accent-color:var(--focus);cursor:pointer;">
+        Only this
+      </label>` : ''}
+      ${s.status==='bad' && s.cfg && s.cfg.url ? `<button class="iconbtn" data-openurl="${esc(s.cfg.url)}" title="Open URL directly to check if it's dead or just blocked">🔗</button>` : ''}
       ${s.status==='bad'?`<button class="iconbtn" data-retrysrc="${s.id}" title="Retry">⟳</button>`:''}
       <button class="iconbtn" data-editsrc="${s.id}" title="Edit">✎</button>
       <button class="iconbtn" data-delsrc="${s.id}" title="Remove">🗑</button>
@@ -985,6 +1005,25 @@ mainEl.addEventListener('click', e=>{
   if(retry){ retrySource(retry.dataset.retrysrc); }
   const edit = e.target.closest('[data-editsrc]');
   if(edit){ openEditSource(edit.dataset.editsrc); }
+  const openUrl = e.target.closest('[data-openurl]');
+  if(openUrl){ window.open(openUrl.dataset.openurl, '_blank'); }
+  if(e.target.id==='clearSourceSelectBtn'){
+    DB.settings.selectedSourceIds = [];
+    saveDB(); renderSourcesTab(); render();
+  }
+});
+mainEl.addEventListener('change', e=>{
+  const chk = e.target.closest('[data-srcselect]');
+  if(chk){
+    const id = chk.dataset.srcselect;
+    let sel = (DB.settings.selectedSourceIds||[]).slice();
+    if(chk.checked){ if(!sel.includes(id)) sel.push(id); }
+    else { sel = sel.filter(x=>x!==id); }
+    DB.settings.selectedSourceIds = sel;
+    saveDB();
+    renderSourcesTab();
+    if(state.tab!=='sources') render();
+  }
 });
 
 /* ================= Add via Phone: QR pairing relay =================
