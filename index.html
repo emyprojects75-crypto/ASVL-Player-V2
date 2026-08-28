@@ -397,10 +397,11 @@ function loadDB(){
       if(!db.settings.allowedLanguages) db.settings.allowedLanguages = [];
       if(!db.settings.allowedGroups) db.settings.allowedGroups = [];
       if(!db.settings.selectedSourceIds) db.settings.selectedSourceIds = [];
+      if(!db.settings.customOrder) db.settings.customOrder = {live:[],movies:[],series:[],radio:[]};
       return db;
     }
   }catch(e){}
-  return { sources:[], items:{live:[],movies:[],series:[],radio:[]}, favorites:{}, history:{}, continueWatching:{}, settings:{theme:'dark', allowedLanguages:[], allowedGroups:[], selectedSourceIds:[]} };
+  return { sources:[], items:{live:[],movies:[],series:[],radio:[]}, favorites:{}, history:{}, continueWatching:{}, settings:{theme:'dark', allowedLanguages:[], allowedGroups:[], selectedSourceIds:[], customOrder:{live:[],movies:[],series:[],radio:[]}} };
 }
 let DB = loadDB();
 function saveDB(){
@@ -680,7 +681,7 @@ function deleteSource(id){
 /* ================= State ================= */
 let state = {
   tab:'home', filterLang:null, filterGroup:null, search:'', focusIndex:0,
-  addType:'m3u', viewMode:'merged'
+  addType:'m3u', viewMode:'merged', reorderMode:false
 };
 
 /* ================= Rendering ================= */
@@ -713,6 +714,45 @@ function matchesFilters(item){
   return true;
 }
 
+function sortItems(kind, items){
+  const order = (DB.settings.customOrder && DB.settings.customOrder[kind]) || [];
+  if(!order.length) return items;
+  const pos = new Map(order.map((id,i)=>[id,i]));
+  return items.slice().sort((a,b)=>{
+    const pa = pos.has(a.id) ? pos.get(a.id) : Infinity;
+    const pb = pos.has(b.id) ? pos.get(b.id) : Infinity;
+    if(pa!==pb) return pa-pb;
+    return 0;
+  });
+}
+function moveItem(kind, id, dir){
+  // Reorders against the FULL item list for this kind (not just what's
+  // currently filtered/visible), so the new order sticks everywhere.
+  const full = sortItems(kind, DB.items[kind]);
+  const idx = full.findIndex(i=>i.id===id);
+  if(idx<0) return;
+  const swapWith = idx + dir;
+  if(swapWith<0 || swapWith>=full.length) return;
+  const tmp = full[idx]; full[idx] = full[swapWith]; full[swapWith] = tmp;
+  if(!DB.settings.customOrder) DB.settings.customOrder = {live:[],movies:[],series:[],radio:[]};
+  DB.settings.customOrder[kind] = full.map(i=>i.id);
+  saveDB();
+  render();
+}
+function moveItemToEdge(kind, id, toStart){
+  // Jumps a channel straight to position 1 (or the very end) in one tap —
+  // e.g. turning the 10th channel into the 1st without repeated ▲ taps.
+  const full = sortItems(kind, DB.items[kind]);
+  const idx = full.findIndex(i=>i.id===id);
+  if(idx<0) return;
+  const [moved] = full.splice(idx,1);
+  if(toStart) full.unshift(moved); else full.push(moved);
+  if(!DB.settings.customOrder) DB.settings.customOrder = {live:[],movies:[],series:[],radio:[]};
+  DB.settings.customOrder[kind] = full.map(i=>i.id);
+  saveDB();
+  render();
+}
+
 function cardHtml(item, kind, opts){
   opts = opts||{};
   const isFav = !!DB.favorites[item.id];
@@ -721,6 +761,7 @@ function cardHtml(item, kind, opts){
   const icon = kind==='live'?'📡':kind==='movies'?'🎬':kind==='series'?'📺':'🎵';
   const linkCount = (item.streams||[]).length;
   const linkAttr = item.__streamIdx!==undefined ? ` data-linkidx="${item.__streamIdx}"` : '';
+  const reorder = opts.reorder;
   return `<div class="card ${poster}" data-id="${item.id}" data-kind="${kind}"${linkAttr} tabindex="0">
     ${kind==='live'?'<div class="badge live">LIVE</div>':''}
     ${linkCount>1?`<div class="badge" style="left:auto;right:${isFav?'32px':'6px'};top:6px;color:var(--focus);cursor:pointer;" data-linkpick="${item.id}">${linkCount} links</div>`:''}
@@ -731,6 +772,12 @@ function cardHtml(item, kind, opts){
       <div class="sub">${esc(item.language||item.group||'')}</div>
     </div>
     ${cw?`<div class="progress" style="width:${Math.min(100,cw.pct||0)}%"></div>`:''}
+    ${reorder?`<div style="position:absolute;bottom:4px;left:4px;right:4px;display:flex;gap:3px;z-index:3;justify-content:center;flex-wrap:wrap;">
+      <button class="iconbtn" data-movetop="${item.id}" data-movekind="${kind}" title="Move to first" style="width:26px;height:26px;font-size:12px;">«</button>
+      <button class="iconbtn" data-moveup="${item.id}" data-movekind="${kind}" title="Move up one" style="width:26px;height:26px;font-size:11px;">▲</button>
+      <button class="iconbtn" data-movedown="${item.id}" data-movekind="${kind}" title="Move down one" style="width:26px;height:26px;font-size:11px;">▼</button>
+      <button class="iconbtn" data-movebottom="${item.id}" data-movekind="${kind}" title="Move to last" style="width:26px;height:26px;font-size:12px;">»</button>
+    </div>`:''}
   </div>`;
 }
 
@@ -754,9 +801,10 @@ function flattenSingleLinks(items){
   return out;
 }
 function viewModeToggleHtml(){
-  return `<div style="display:flex;gap:6px;margin:2px 4px 12px;">
+  return `<div style="display:flex;gap:6px;margin:2px 4px 12px;flex-wrap:wrap;">
     <div class="chip ${state.viewMode!=='single'?'active':''}" data-viewmode="merged" tabindex="0">Merged channels</div>
     <div class="chip ${state.viewMode==='single'?'active':''}" data-viewmode="single" tabindex="0">Single links (all)</div>
+    <div class="chip ${state.reorderMode?'active':''}" data-reordertoggle="1" tabindex="0">${state.reorderMode?'✓ Reordering':'↕ Reorder'}</div>
   </div>`;
 }
 
@@ -795,10 +843,10 @@ function renderHome(){
   html += section('Continue Watching', cwItems, 'mixed', {scroll:true, limit:20});
   html += section('Favorites', favItems, 'mixed', {scroll:true, limit:20});
   html += section('Recently Added', recent, 'mixed', {scroll:true, limit:20});
-  html += section('Live TV', visibleItems('live'), 'live', {scroll:true, limit:20});
-  html += section('Media Library', visibleItems('movies'), 'movies', {scroll:true, limit:20});
-  html += section('Series', visibleItems('series'), 'series', {scroll:true, limit:20});
-  html += section('Radio', visibleItems('radio'), 'radio', {scroll:true, limit:20});
+  html += section('Live TV', sortItems('live', visibleItems('live')), 'live', {scroll:true, limit:20});
+  html += section('Media Library', sortItems('movies', visibleItems('movies')), 'movies', {scroll:true, limit:20});
+  html += section('Series', sortItems('series', visibleItems('series')), 'series', {scroll:true, limit:20});
+  html += section('Radio', sortItems('radio', visibleItems('radio')), 'radio', {scroll:true, limit:20});
   if(!html && DB.items.live.length+DB.items.movies.length+DB.items.series.length+DB.items.radio.length>0){
     mainEl.innerHTML = `<div class="empty"><div class="big">🚫</div>Nothing matches your current Content Filter.<br>Adjust it in Settings.</div>`;
     return;
@@ -811,7 +859,7 @@ function kindLabel(kind){
 }
 function renderKindTab(kind){
   renderFilterbar(kind);
-  const base = DB.items[kind].filter(matchesFilters);
+  const base = sortItems(kind, DB.items[kind].filter(matchesFilters));
   if(!DB.items[kind].length){
     mainEl.innerHTML = `<div class="empty"><div class="big">${kind==='live'?'📡':kind==='movies'?'🎬':kind==='series'?'📺':'🎵'}</div>
       No ${esc(kindLabel(kind))} content yet. Add a source to get started.</div>`;
@@ -822,20 +870,62 @@ function renderKindTab(kind){
     return;
   }
   const items = state.viewMode==='single' ? flattenSingleLinks(base) : base;
-  mainEl.innerHTML = viewModeToggleHtml() + `<div class="grid">${items.map(i=>cardHtml(i,kind)).join('')}</div>`;
+  const showReorderButtons = state.reorderMode && state.viewMode!=='single';
+  const reorderHint = state.reorderMode ? (state.viewMode==='single'
+    ? `<div style="font-size:11px;color:var(--sub);margin:0 4px 10px;">Switch to "Merged channels" to reorder — single-link rows can't be repositioned individually.</div>`
+    : `<div style="font-size:11px;color:var(--sub);margin:0 4px 10px;">« jumps a channel straight to first, » to last — ▲/▼ nudge it one spot at a time. Order is saved automatically.</div>`) : '';
+  mainEl.innerHTML = viewModeToggleHtml() + reorderHint +
+    `<div class="grid">${items.map(i=>cardHtml(i,kind,{reorder:showReorderButtons})).join('')}</div>`;
 }
 
 function renderFavorites(){
   filterbarEl.style.display='none';
   const items = Object.keys(DB.favorites).map(id=>findItem(id)).filter(Boolean).filter(matchesFilters);
   if(!items.length){ mainEl.innerHTML = `<div class="empty"><div class="big">☆</div>No favorites yet. Tap the star on any item.</div>`; return; }
-  mainEl.innerHTML = `<div class="grid">${items.map(i=>cardHtml(i, i.__kind||'mixed')).join('')}</div>`;
+  const orphanCount = items.filter(i=>i.__orphaned).length;
+  const banner = orphanCount ? `<div style="font-size:11px;color:var(--sub);margin:0 4px 10px;">
+      ${orphanCount} of these came from a source that was later removed/edited — they still play from the link
+      saved when you favorited them. Remove the star manually if you no longer want them.</div>` : '';
+  mainEl.innerHTML = `<div style="display:flex;gap:6px;margin:2px 4px 12px;">
+      <button class="btn secondary" id="downloadFavsBtn" style="width:auto;padding:8px 14px;">⬇ Download Favorites (M3U)</button>
+    </div>` + banner + `<div class="grid">${items.map(i=>cardHtml(i, i.__kind||'mixed')).join('')}</div>`;
 }
+function downloadFavoritesM3U(){
+  const items = Object.keys(DB.favorites).map(id=>findItem(id)).filter(Boolean);
+  if(!items.length){ toast('No favorites to download'); return; }
+  let out = '#EXTM3U\n';
+  items.forEach(it=>{
+    const url = it.streams && it.streams[0] && it.streams[0].url;
+    if(!url) return;
+    const attrs = [
+      it.logo ? `tvg-logo="${it.logo}"` : '',
+      it.group ? `group-title="${it.group}"` : ''
+    ].filter(Boolean).join(' ');
+    out += `#EXTINF:-1 ${attrs},${it.name}\n${url}\n`;
+  });
+  const blob = new Blob([out], {type:'application/vnd.apple.mpegurl'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'favorites.m3u';
+  a.click();
+  toast('Downloaded favorites.m3u');
+}
+mainEl.addEventListener('click', e=>{
+  if(e.target.id==='downloadFavsBtn') downloadFavoritesM3U();
+});
 
 function findItem(id){
   for(const k of ['live','movies','series','radio']){
     const f = DB.items[k].find(i=>i.id===id);
     if(f){ f.__kind = k; return f; }
+  }
+  // Not in the live channel list anymore (source/link was deleted) — if it's
+  // a favorite, fall back to the snapshot taken when it was favorited, so
+  // it still shows up and still plays.
+  const snap = DB.favorites[id];
+  if(snap && typeof snap==='object' && snap.streams){
+    return { id, name:snap.name, logo:snap.logo, group:snap.group, language:snap.language,
+      streams: snap.streams, __kind: snap.kind||'live', __orphaned: true };
   }
   return null;
 }
@@ -929,7 +1019,21 @@ mainEl.addEventListener('click', e=>{
   if(fav){
     e.stopPropagation();
     const id = fav.dataset.fav;
-    if(DB.favorites[id]) delete DB.favorites[id]; else DB.favorites[id]=true;
+    if(DB.favorites[id]){
+      delete DB.favorites[id]; // manual removal — the only way a favorite goes away
+    } else {
+      const item = findItem(id);
+      if(item){
+        // Snapshot the full channel (name/logo/streams) at the moment of
+        // favoriting — not just a reference to it — so this favorite
+        // keeps working even if the source or individual links it came
+        // from are later edited or deleted.
+        DB.favorites[id] = {
+          name: item.name, logo: item.logo, group: item.group, language: item.language,
+          kind: item.__kind, streams: JSON.parse(JSON.stringify(item.streams||[]))
+        };
+      }
+    }
     saveDB(); render();
     return;
   }
@@ -937,6 +1041,16 @@ mainEl.addEventListener('click', e=>{
   if(pick){ e.stopPropagation(); openLinkPicker(pick.dataset.linkpick); return; }
   const vm = e.target.closest('[data-viewmode]');
   if(vm){ state.viewMode = vm.dataset.viewmode; render(); return; }
+  const rt = e.target.closest('[data-reordertoggle]');
+  if(rt){ state.reorderMode = !state.reorderMode; render(); return; }
+  const up = e.target.closest('[data-moveup]');
+  if(up){ e.stopPropagation(); moveItem(up.dataset.movekind, up.dataset.moveup, -1); return; }
+  const down = e.target.closest('[data-movedown]');
+  if(down){ e.stopPropagation(); moveItem(down.dataset.movekind, down.dataset.movedown, 1); return; }
+  const top = e.target.closest('[data-movetop]');
+  if(top){ e.stopPropagation(); moveItemToEdge(top.dataset.movekind, top.dataset.movetop, true); return; }
+  const bottom = e.target.closest('[data-movebottom]');
+  if(bottom){ e.stopPropagation(); moveItemToEdge(bottom.dataset.movekind, bottom.dataset.movebottom, false); return; }
   const card = e.target.closest('.card');
   if(card){
     const idx = card.dataset.linkidx!==undefined ? parseInt(card.dataset.linkidx,10) : undefined;
@@ -970,7 +1084,9 @@ function deleteStreamLink(itemId, idx){
   if(item.streams.length===0){
     const kind = item.__kind;
     DB.items[kind] = DB.items[kind].filter(i=>i.id!==itemId);
-    delete DB.favorites[itemId];
+    // Favorites are intentionally left alone here — they were snapshotted
+    // at favorite-time and only go away when the star is unfavorited
+    // manually, even if every underlying link/source is later removed.
     delete DB.continueWatching[itemId];
     itemGone = true;
   }
